@@ -20,8 +20,8 @@
  */
 
 /*a Includes */
-include "types/apb.h"
-include "boards/de1_cl/de1_cl_types.h"
+include "apb::apb.h"
+include "de1_cl_types.h"
 
 /*a Modules - see also csr_target_apb, csr_master_apb in csr_interface.h */
 /*m apb_target_de1_cl_inputs */
