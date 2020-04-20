@@ -1,0 +1,434 @@
+/** Copyright (C) 2016-2017,  Gavin J Stark.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @file   bbc_micro_de1_cl.cdl
+ * @brief  BBC microcomputer with RAMs for the CL DE1 + daughterboard
+ *
+ * CDL module containing the BBC microcomputer with RAMs and a
+ * framebuffer for the Cambridge University Computer Laboratory DE1 +
+ * daughterboard system.
+ *
+ */
+/*a Includes */
+include "types/ps2.h"
+include "types/led.h"
+include "types/teletext.h"
+include "types/dprintf.h"
+include "types/apb.h"
+include "utils/dprintf_modules.h"
+include "input/ps2_modules.h"
+include "boards/de1.h"
+include "boards/de1_cl/de1_cl_types.h"
+include "apb/apb_targets.h"
+include "apb/apb_masters.h"
+include "csr/csr_masters.h"
+include "led/led_modules.h"
+include "video/framebuffer_modules.h"
+include "srams.h"
+include "microcomputers/bbc/bbc_types.h"
+include "microcomputers/bbc/bbc_submodules.h"
+
+/*a Constants */
+constant bit[8] sr_divider    = 49; // 1MHz
+constant bit[8] divider_400ns = 19; // 2.5MHz
+constant integer num_dprintf_requesters=12;
+
+/*a Types */
+/*t t_debug_combs */
+typedef struct {
+    bit selected_data;
+    bit timer_10ms;
+} t_debug_combs;
+
+/*t t_debug_state */
+typedef struct {
+    bit[32] cpu_ticks;
+    bit[32] video_2MHz_ticks;
+    bit[32] falling_1MHz_ticks;
+    bit[32] rising_1MHz_ticks;
+    bit[32] counter_0;
+    bit[32] counter_1;
+    bit[32] update;
+} t_debug_state;
+
+/*t t_key_state */
+typedef struct {
+    bit[10] fn_keys_down;
+    bit[4] last_fn_key;
+    bit speed_selection_changed;
+    bit video_selection_changed;
+    bit[4] speed_selection;
+    bit[4] video_selection;
+} t_key_state;
+
+/*a Module */
+module bbc_micro_de1_cl_io( clock clk          "50MHz clock from DE1 clock generator",
+                            clock video_clk    "9MHz clock from PLL, derived from 50MHz",
+                            input bit reset_n  "hard reset from a pin - a key on DE1",
+                            input bit bbc_reset_n,
+                            input bit framebuffer_reset_n,
+                            input t_de1_inputs de1_inputs,
+                            input t_bbc_clock_control clock_control,
+                            output t_bbc_keyboard bbc_keyboard,
+                            output t_video_bus video_bus,
+                            output t_csr_request csr_request,
+                            input t_csr_response csr_response,
+                            input t_ps2_pins ps2_in   "PS2 input pins",
+                            output t_ps2_pins ps2_out "PS2 output pin driver open collector",
+                            input  t_de1_cl_inputs_status   inputs_status  "DE1 CL daughterboard shifter register etc status",
+                            output t_de1_cl_inputs_control  inputs_control "DE1 CL daughterboard shifter register control",
+                            output bit lcd_source,
+                            output t_de1_leds de1_leds,
+                            output bit led_chain
+    )
+{
+    net bit led_chain;
+    net t_video_bus video_bus;
+
+    net t_ps2_pins ps2_out;
+    net t_ps2_rx_data ps2_rx_data;
+    net t_ps2_key_state  ps2_key;
+
+    clocked clock clk reset active_low reset_n t_csr_response csr_response_r = {*=0};
+    comb    t_csr_response combined_csr_response;
+    net t_csr_response tt_framebuffer_csr_response;
+
+    net  t_led_ws2812_request led_request;
+    comb t_led_ws2812_data    led_data;
+    clocked clock clk reset active_low reset_n t_led_ws2812_data[12] led_state={*=0};
+    net  t_de1_cl_inputs_control  inputs_control;
+    net  t_de1_cl_user_inputs     user_inputs;
+
+    net bit[num_dprintf_requesters] dprintf_ack;
+    clocked clock clk reset active_low reset_n t_dprintf_req_4[num_dprintf_requesters] dprintf_req={*=0};
+    net bit[num_dprintf_requesters-1]           dprintf_mux_ack;
+    net t_dprintf_req_4[num_dprintf_requesters-1] dprintf_mux_req;
+    net t_dprintf_byte dprintf_byte;
+    comb t_sram_access_req tt_display_sram_access_req;
+
+    comb t_debug_combs debug_combs;
+    clocked clock clk reset active_low reset_n t_debug_state debug_state={*=0};
+    clocked clock clk reset active_low reset_n t_key_state key_state={*=0};
+    clocked clock clk reset active_low reset_n bit[4] keys_r={*=0};
+
+    /*b Debug stuff */
+    debug_logic """
+    """: {
+        debug_combs = {*=0};
+        debug_combs.timer_10ms = 0;
+        if (debug_state.update==500*1000-1) {
+            debug_combs.timer_10ms = 1;
+        }
+
+        debug_state.update <= debug_state.update+1;
+        if (clock_control.enable_cpu)          {debug_state.cpu_ticks <= debug_state.cpu_ticks+1; }
+        if (clock_control.enable_2MHz_video)   {debug_state.video_2MHz_ticks <= debug_state.video_2MHz_ticks+1;}
+        if (clock_control.enable_1MHz_rising)  {debug_state.rising_1MHz_ticks <= debug_state.rising_1MHz_ticks+1;}
+        if (clock_control.enable_1MHz_falling) {debug_state.falling_1MHz_ticks <= debug_state.falling_1MHz_ticks+1;}
+
+        if (clock_control.debug[0] && !de1_inputs.switches[4]) { debug_state.counter_0 <= debug_state.counter_0+1; }
+        if (clock_control.debug[1] && !de1_inputs.switches[4]) { debug_state.counter_1 <= debug_state.counter_1+1; }
+        if (clock_control.debug[2] &&  de1_inputs.switches[4]) { debug_state.counter_0 <= debug_state.counter_0+1; }
+        if (clock_control.debug[3] &&  de1_inputs.switches[4]) { debug_state.counter_1 <= debug_state.counter_1+1; }
+
+        if (debug_combs.timer_10ms) {
+            debug_state.update <= 0;
+            debug_state.cpu_ticks <= 0;
+            debug_state.video_2MHz_ticks <= 0;
+            debug_state.rising_1MHz_ticks <= 0;
+            debug_state.falling_1MHz_ticks <= 0;
+            debug_state.counter_0 <= 0;
+            debug_state.counter_1 <= 0;
+        }
+    }
+
+    /*b Miscellaneous logic */
+    misc_logic """
+    """: {
+        key_state.speed_selection_changed <= 0;
+        key_state.video_selection_changed <= 0;
+
+        if (user_inputs.right_dial.direction_pulse) {
+            key_state.fn_keys_down <= 0;
+            if (user_inputs.right_dial.direction) {
+                key_state.last_fn_key <= key_state.last_fn_key+1;
+                if (key_state.last_fn_key==9) {
+                    key_state.last_fn_key <= 0;
+                }
+            } else {
+                key_state.last_fn_key <= key_state.last_fn_key-1;
+                if (key_state.last_fn_key==0) {
+                    key_state.last_fn_key <= 9;
+                }
+            }
+        }
+        if (user_inputs.left_dial.direction_pulse) {
+            if (user_inputs.left_dial.pressed) {
+                key_state.video_selection_changed <= 1;
+                if (user_inputs.left_dial.direction) {
+                    key_state.video_selection <= key_state.video_selection+1;
+                    if (key_state.video_selection==11) {key_state.video_selection <= 0;}
+                } else {
+                    key_state.video_selection <= key_state.video_selection-1;
+                    if (key_state.video_selection==0) {key_state.video_selection <= 11;}
+                }
+            } else {
+                key_state.speed_selection_changed <= 1;
+                if (user_inputs.left_dial.direction) {
+                    key_state.speed_selection <= key_state.speed_selection+1;
+                    if (key_state.speed_selection==11) {key_state.speed_selection <= 0;}
+                } else {
+                    key_state.speed_selection <= key_state.speed_selection-1;
+                    if (key_state.speed_selection==0) {key_state.speed_selection <= 11;}
+                }
+            }
+        }
+        if (user_inputs.right_dial.pressed) {
+            key_state.fn_keys_down <= 0;
+            key_state.fn_keys_down[key_state.last_fn_key] <= 1;
+        } else {
+            key_state.fn_keys_down <= 0;
+        }
+        lcd_source = de1_inputs.switches[3];
+    }
+
+    /*b LED chain logic */
+    led_chain_logic """
+    """: {
+        for (i; 12) {
+            led_state[i] <= {*=0};
+            if (user_inputs.left_dial.pressed) {
+                if (key_state.video_selection>=i) {led_state[i].blue <= 8h3f;}
+            } else {
+                if (key_state.speed_selection>=i) {led_state[i].red <= 8h3f;}
+            }
+        }
+
+        led_data = {*=0};
+        if (led_request.ready) {
+            part_switch(led_request.led_number) {
+            case  0: {led_data = led_state[0]; }
+            case  1: {led_data = led_state[1]; }
+            case  2: {led_data = led_state[2]; }
+            case  3: {led_data = led_state[3]; }
+            case  4: {led_data = led_state[4]; }
+            case  5: {led_data = led_state[5]; }
+            case  6: {led_data = led_state[6]; }
+            case  7: {led_data = led_state[7]; }
+            case  8: {led_data = led_state[8]; }
+            case  9: {led_data = led_state[9]; }
+            case 10: {led_data = led_state[10]; }
+            case 11: {led_data = led_state[11]; }
+            }
+            led_data.valid = 1;
+            if (led_request.led_number==11) {
+                led_data.last=1;
+            }
+        }
+        led_ws2812_chain neopixels( clk <- clk,
+                                    reset_n <= reset_n,
+                                    divider_400ns <= divider_400ns,
+                                    led_request   => led_request,
+                                    led_data      <= led_data,
+                                    led_chain     => led_chain );
+    }
+
+    /*b Keyboard input */
+    net t_bbc_keyboard bbc_ps2_keyboard;
+    keyboard_input: {
+        ps2_host ps2( clk <- clk,
+                      reset_n <= reset_n,
+                      ps2_in <= ps2_in,
+                      ps2_out => ps2_out,
+                      ps2_rx_data => ps2_rx_data,
+                      divider <= 150 );
+        
+        ps2_host_keyboard key_decode(clk <- clk,
+                                     reset_n <= reset_n,
+                                     ps2_rx_data <= ps2_rx_data,
+                                     ps2_key     => ps2_key );
+
+        bbc_keyboard_ps2 bbc_ps2_kbd( clk<-clk,
+                                      reset_n <= bbc_reset_n,
+                                      ps2_key <= ps2_key,
+                                      keyboard => bbc_ps2_keyboard );
+
+        keys_r <= de1_inputs.keys;
+        bbc_keyboard.reset_pressed = 0;
+        bbc_keyboard.keys_down_cols_0_to_7 = bbc_ps2_keyboard.keys_down_cols_0_to_7;
+        bbc_keyboard.keys_down_cols_8_to_9 = bbc_ps2_keyboard.keys_down_cols_8_to_9;
+        bbc_keyboard.keys_down_cols_0_to_7[0*8+0] |= !keys_r[0]; // shift
+        bbc_keyboard.keys_down_cols_0_to_7[1*8+0] |= !keys_r[1]; // ctrl
+        bbc_keyboard.keys_down_cols_0_to_7[5*8+5] |= !keys_r[2]; // N
+        bbc_keyboard.keys_down_cols_0_to_7[1*8+5] |= user_inputs.joystick.u; // s
+        bbc_keyboard.keys_down_cols_0_to_7[2*8+4] |= user_inputs.joystick.d; // x
+        bbc_keyboard.keys_down_cols_0_to_7[6*8+6] |= user_inputs.joystick.l; // !! ,
+        bbc_keyboard.keys_down_cols_0_to_7[7*8+6] |= user_inputs.joystick.r; // .
+        bbc_keyboard.keys_down_cols_0_to_7[0*8+2] |= user_inputs.joystick.c; // !! f0
+        bbc_keyboard.keys_down_cols_0_to_7[2*8+6] |= user_inputs.diamond.y; // space
+        bbc_keyboard.keys_down_cols_8_to_9[0*8+6] |= user_inputs.diamond.a; // /
+        bbc_keyboard.keys_down_cols_0_to_7[1*8+4] |= user_inputs.diamond.b; // a (fire, right of diamond)
+        bbc_keyboard.keys_down_cols_0_to_7[5*8+4] |= user_inputs.diamond.x; // j left of diamond
+        bbc_keyboard.keys_down_cols_0_to_7[0*8+2] |= key_state.fn_keys_down[0]; // f0
+        bbc_keyboard.keys_down_cols_0_to_7[1*8+7] |= key_state.fn_keys_down[1]; // f1
+        bbc_keyboard.keys_down_cols_0_to_7[2*8+7] |= key_state.fn_keys_down[2]; // f2
+        bbc_keyboard.keys_down_cols_0_to_7[3*8+7] |= key_state.fn_keys_down[3]; // f3
+        bbc_keyboard.keys_down_cols_0_to_7[4*8+1] |= key_state.fn_keys_down[4]; // f4
+        bbc_keyboard.keys_down_cols_0_to_7[4*8+7] |= key_state.fn_keys_down[5]; // f5
+        bbc_keyboard.keys_down_cols_0_to_7[5*8+7] |= key_state.fn_keys_down[6]; // f6
+        bbc_keyboard.keys_down_cols_0_to_7[6*8+1] |= key_state.fn_keys_down[7]; // f7
+        bbc_keyboard.keys_down_cols_0_to_7[6*8+7] |= key_state.fn_keys_down[8]; // f8
+        bbc_keyboard.keys_down_cols_0_to_7[7*8+7] |= key_state.fn_keys_down[9]; // f9
+
+        //bbc_keyboard.keys_down_cols_8_to_9[1*8+3] |= user_inputs.joystick.u; // up
+        //bbc_keyboard.keys_down_cols_8_to_9[1*8+2] |= user_inputs.joystick.d; // down
+        //bbc_keyboard.keys_down_cols_8_to_9[1*8+1] |= user_inputs.joystick.l; // left
+        //bbc_keyboard.keys_down_cols_8_to_9[1*8+7] |= user_inputs.joystick.r; // right
+        de1_cl_controls controls( clk <- clk,
+                                  reset_n <= reset_n,
+                                  sr_divider <= sr_divider,
+                                  inputs_control => inputs_control,
+                                  inputs_status  <= inputs_status,
+                                  user_inputs    => user_inputs );
+
+    }
+
+    /*b Teletext framebuffers */
+    tt_framebuffer: {
+        for (i; num_dprintf_requesters) {
+            if (dprintf_ack[i]) {
+                dprintf_req[i].valid <= 0;
+            }
+        }
+        if (debug_combs.timer_10ms) {
+            dprintf_req[0] <= {valid=1, address=00, data_0=64h0d_04_1d_02_43_50_55_20, data_1=64h53_70_65_65_64_20_ff_ff, data_2=bundle(8hc3+(5<<2), debug_state.cpu_ticks, 24h30_30_20), data_3=64h46_6a_ff_00_00_00_00_00};
+            dprintf_req[1] <= {valid=1, address=40, data_0=64h0d_04_1d_02_43_50_55_20, data_1=64h53_70_65_65_64_20_ff_ff, data_2=bundle(8hc3+(5<<2), debug_state.cpu_ticks, 24h30_30_20), data_3=64h46_6a_ff_00_00_00_00_00};
+
+            dprintf_req[4] <= {valid=1, address=240,  data_0=64h52_69_67_68_74_20_44_69, data_1=bundle(24h61_6c_3a, user_inputs.right_dial.pressed?8h01:8h06, 8h80, 4b0,key_state.last_fn_key,16hff)};
+            dprintf_req[5] <= {valid=1, address=280,  data_0=64h4c_65_66_74_20_44_69_61, data_1=bundle(24h6c_20_3a, user_inputs.left_dial.pressed?8h01:8h06, 8h80, 4b0,key_state.speed_selection,16hff)};
+            dprintf_req[6] <= {valid=1, address=360, data_0=64h32_4d_68_7a_20_56_69_64, data_1=bundle(24h65_6f_3a, 8hc3+(6<<2), debug_state.video_2MHz_ticks)};
+            dprintf_req[7] <= {valid=1, address=400, data_0=64h31_4d_68_7a_20_66_61_6c, data_1=bundle(24h6c_20_3a, 8hc3+(6<<2), debug_state.falling_1MHz_ticks)};
+            dprintf_req[8] <= {valid=1, address=440, data_0=64h31_4d_68_7a_20_72_69_73, data_1=bundle(24h65_20_3a, 8hc3+(6<<2), debug_state.rising_1MHz_ticks)};
+            dprintf_req[9] <= {valid=1, address=480, data_0=64h44_65_62_75_67_20_30_3a, data_1=bundle(8hc3+(6<<2), debug_state.counter_0, 8h83, 16b0)};
+            dprintf_req[10] <= {valid=1, address=520, data_0=64h44_65_62_75_67_20_31_3a, data_1=bundle(8hc3+(6<<2), debug_state.counter_1, 8h83, 12b0, clock_control.debug)};
+        }
+        if (ps2_key.valid) {
+            dprintf_req[11] <= {valid=1, address=600,
+                    data_0=64h50_53_32_20_6b_65_79_3a,
+                    data_1=bundle(ps2_key.release?8h02:8h01, ps2_key.extended?8h45:8h00, 8h81, ps2_key.key_number, 32h2020ffff) };
+        }
+
+        dprintf_4_mux tdm01( clk <- clk,
+                                    reset_n <= reset_n,
+                                    req_a <= dprintf_req[0],
+                                    ack_a => dprintf_ack[0],
+                                    req_b <= dprintf_req[1],
+                                    ack_b => dprintf_ack[1],
+                                    req => dprintf_mux_req[0],
+                                    ack <= dprintf_mux_ack[0] );
+
+        for (i; num_dprintf_requesters-2) {
+            dprintf_4_mux tdm[i]( clk <- clk, reset_n <= reset_n,
+                                         req_a <= dprintf_req[2+i],
+                                         ack_a => dprintf_ack[2+i],
+                                         req_b <= dprintf_mux_req[i],
+                                         ack_b => dprintf_mux_ack[i],
+                                         req => dprintf_mux_req[i+1],
+                                         ack <= dprintf_mux_ack[i+1] );
+        }
+
+        dprintf dprintf( clk <- clk,
+                         reset_n <= reset_n,
+                         dprintf_req <= dprintf_mux_req[num_dprintf_requesters-2],
+                         dprintf_ack => dprintf_mux_ack[num_dprintf_requesters-2],
+                         byte_blocked <= 0,
+                         dprintf_byte => dprintf_byte
+            );
+
+        tt_display_sram_access_req = {*=0,
+                                      valid = dprintf_byte.valid,
+                                      address = bundle(16b0, dprintf_byte.address),
+                                      write_data = bundle(56b0, dprintf_byte.data) };
+
+        framebuffer_teletext ftb( csr_clk <- clk,
+                                  sram_clk <- clk,
+                                  video_clk <- video_clk,
+                                  reset_n <= framebuffer_reset_n,
+                                  video_bus => video_bus,
+                                  display_sram_write <= tt_display_sram_access_req,
+                                  csr_select_in <= bbc_csr_select_framebuffer,
+                                  csr_request <= csr_request,
+                                  csr_response => tt_framebuffer_csr_response
+            );
+                        
+    }
+
+    /*b APB / CSR logic*/
+    net t_csr_request   csr_request;
+    net t_apb_request   apb_request;
+    net t_apb_response  apb_response;
+    comb t_apb_processor_request  apb_processor_request;
+    net t_apb_processor_response  apb_processor_response;
+    net t_apb_rom_request         apb_rom_request;
+    net bit[40]                   apb_rom_data;
+    apb_csr_logic """
+    """ : {
+        apb_processor_request = {*=0};
+        if (key_state.speed_selection_changed) {
+            apb_processor_request.address[5;4] = bundle(1b0,key_state.speed_selection);
+            apb_processor_request.valid = 1;
+        }
+        if (key_state.video_selection_changed) {
+            apb_processor_request.address[5;4] = bundle(1b1,key_state.video_selection);
+            apb_processor_request.valid = 1;
+        }
+
+        de1_leds = {*=0};
+        de1_leds.leds[0] = apb_processor_request.valid;
+        de1_leds.leds[1] = apb_processor_response.acknowledge;
+        de1_leds.leds[2] = apb_processor_response.rom_busy;
+        de1_leds.leds[3] = csr_request.valid;
+        de1_leds.leds[4] = csr_response_r.acknowledge;
+        combined_csr_response = csr_response;
+        combined_csr_response |= tt_framebuffer_csr_response;
+        csr_response_r <= csr_response;
+
+        apb_processor apbp( clk <- clk,
+                            reset_n <= reset_n,
+
+                            apb_processor_request <= apb_processor_request,
+                            apb_processor_response => apb_processor_response,
+                            apb_request   => apb_request,
+                            apb_response  <= apb_response,
+                            rom_request   => apb_rom_request,
+                            rom_data      <= apb_rom_data );
+
+        se_sram_srw_256x40 apb_rom(sram_clock <- clk,
+                                   select <= apb_rom_request.enable,
+                                   address <= apb_rom_request.address[8;0],
+                                   read_not_write <= 1,
+                                   write_data <= 0,
+                                   data_out => apb_rom_data );
+
+        csr_master_apb master( clk <- clk,
+                               reset_n <= reset_n,
+                               apb_request <= apb_request,
+                               apb_response => apb_response,
+                               csr_request => csr_request,
+                               csr_response <= csr_response_r );
+
+    }
+
+    /*b All done */
+}
