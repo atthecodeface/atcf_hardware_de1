@@ -3,6 +3,7 @@ include ${CDL_ROOT}/lib/cdl/cdl_templates.mk
 SRC_ROOT   = $(abspath ${CURDIR})
 OTHER_SRCS = ${SRC_ROOT}/../*
 BUILD_ROOT = ${SRC_ROOT}/build
+TEST_DIR   = ${CURDIR}/test
 
 all: sim
 
@@ -13,5 +14,5 @@ $(eval $(call cdl_makefile_template,${SRC_ROOT},${BUILD_ROOT},${OTHER_SRCS}))
 smoke: ${SIM}
 	${Q} echo "No tests for de1 yet"
 
-# ${Q}(cd ${SRC_ROOT}/test && PATH=${SRC_ROOT}/python:${PATH} ${MAKE} ${MAKEFLAGS} SIM=${SIM} smoke)
+#	${Q}(cd ${TEST_DIR} && PATH=${CURDIR}/python:${PATH} ${MAKE} Q=${Q} SIM=${SIM} smoke)
 
